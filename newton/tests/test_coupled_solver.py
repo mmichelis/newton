@@ -1902,6 +1902,66 @@ class TestSolverCoupledMuJoCoVBDMultiEnv(unittest.TestCase):
         # End indices must stay within the compacted joint range (no OOB).
         self.assertTrue(all(e <= view.joint_count for e in ends))
 
+    def test_compacted_articulation_end_excludes_loop_closing_joints(self):
+        """Compacted articulation_end must mark the tree-joint boundary, not the next start.
+
+        Loop-closing joints occupy ``[articulation_end[a], articulation_start[a+1])``.
+        Compaction must derive the local end from the global ``articulation_end`` so
+        forward kinematics does not iterate a loop joint as a tree joint. Regression:
+        the end was set to the next articulation's start, swallowing the loop joint.
+        """
+        world_count = 2
+        template = newton.ModelBuilder(gravity=0.0)
+
+        # Articulation A (the "rigid" entry): free base + revolute link (tree joints),
+        # plus a loop-closing joint kept out of the articulation, so it stays positioned
+        # after the tree-joint end.
+        base = template.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)), label="base")
+        j_base = template.add_joint_free(child=base)
+        link = template.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)), label="link")
+        j_link = template.add_joint_revolute(parent=base, child=link, axis=(0.0, 0.0, 1.0))
+        template.add_articulation([j_base, j_link])
+        j_loop = template.add_joint_revolute(parent=link, child=base, axis=(0.0, 0.0, 1.0), label="loop")
+        # Articulation B: a free body owned by the other entry.
+        free_body = template.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)), label="free")
+        j_free = template.add_joint_free(child=free_body)
+        template.add_articulation([j_free])
+
+        builder = newton.ModelBuilder(gravity=0.0)
+        builder.replicate(template, world_count=world_count)
+        model = builder.finalize(device="cpu")
+
+        bpw, jpw = template.body_count, template.joint_count
+
+        def expand(ids, stride):
+            return [w * stride + i for w in range(world_count) for i in ids]
+
+        coupled = SolverCoupled(
+            model=model,
+            entries=[
+                SolverCoupled.Entry(
+                    name="rigid", solver=SolverSemiImplicit,
+                    bodies=expand([base, link], bpw), joints=expand([j_base, j_link, j_loop], jpw),
+                ),
+                SolverCoupled.Entry(
+                    name="free", solver=SolverSemiImplicit,
+                    bodies=expand([free_body], bpw), joints=expand([j_free], jpw),
+                ),
+            ],
+        )
+
+        view = coupled.view("rigid")
+        starts = view.articulation_start.numpy().tolist()
+        ends = view.articulation_end.numpy().tolist()
+        # One articulation per world: each spans 3 joints (free + revolute + loop), with
+        # the loop joint sitting between the tree-joint end and the next start.
+        self.assertEqual(starts, [0, 3, 6])
+        self.assertEqual(ends, [2, 5])
+        # The tree-joint end must stop strictly before the loop-closing joint.
+        for a in range(len(ends)):
+            self.assertLess(ends[a], starts[a + 1])
+        self.assertTrue(all(e <= view.joint_count for e in ends))
+
 
 class TestSolverAdmmContactKernels(unittest.TestCase):
     """ADMM contact fill kernels should respect solver-local body ids."""

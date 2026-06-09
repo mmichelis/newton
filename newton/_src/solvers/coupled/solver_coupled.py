@@ -1000,12 +1000,13 @@ class SolverCoupled(SolverBase, CouplingInterface):
             )
             self._compact_shape_contact_pairs(view, shape_global_to_local)
 
-        articulation_starts = self._compact_articulation_starts(joint_order, articulation_order)
+        articulation_starts, articulation_ends = self._compact_articulation_bounds(joint_order, articulation_order)
         view.articulation_start = wp.array(articulation_starts, dtype=wp.int32, device=device)
-        # Rebase articulation_end to local joint indices too; the generic prefix
-        # selector only gathers it by value (global indices), which mismatches the
-        # rebased starts and corrupts solver FK (e.g. out-of-bounds joint ranges).
-        view.articulation_end = wp.array(articulation_starts[1:], dtype=wp.int32, device=device)
+        # Rebase articulation_end to local joint indices too. The generic prefix selector
+        # only gathers it by value (global indices), which mismatches the rebased starts
+        # and corrupts solver FK. The end marks the tree-joint boundary, not the next
+        # articulation's start, so loop-closing joints stay outside the FK range.
+        view.articulation_end = wp.array(articulation_ends, dtype=wp.int32, device=device)
         self._set_compact_articulation_extents(view, articulation_order)
 
         self._compact_equality_constraints(
@@ -1247,23 +1248,43 @@ class SolverCoupled(SolverBase, CouplingInterface):
         view.shape_contact_pairs = wp.array(array, dtype=wp.vec2i, device=self.model.device)
         view.shape_contact_pair_count = len(compact)
 
-    def _compact_articulation_starts(
+    def _compact_articulation_bounds(
         self,
         joint_order: Sequence[int],
         articulation_order: Sequence[int],
-    ) -> list[int]:
+    ) -> tuple[list[int], list[int]]:
+        """Rebase ``articulation_start``/``articulation_end`` to local joint indices.
+
+        ``articulation_end[a]`` is the exclusive end of an articulation's regular tree
+        joints; loop-closing joints occupy ``[articulation_end[a], articulation_start[a+1])``
+        (see :attr:`~newton.Model.articulation_end`). The end therefore cannot be taken
+        as the next articulation's start -- it is derived from the global
+        ``articulation_end`` cutoff, mirroring ``ModelBuilder``'s tree-joint accounting.
+        """
         joint_global_to_local = {global_id: local_id for local_id, global_id in enumerate(joint_order)}
         joint_articulation = self.model.joint_articulation.numpy() if self.model.joint_count else []
+        global_articulation_end = (
+            self.model.articulation_end.numpy() if self.model.articulation_end is not None else []
+        )
         starts: list[int] = []
+        ends: list[int] = []
         for articulation in articulation_order:
             local_joints = [
                 local
                 for global_joint, local in joint_global_to_local.items()
                 if int(joint_articulation[global_joint]) == int(articulation)
             ]
-            starts.append(min(local_joints) if local_joints else len(joint_order))
+            local_start = min(local_joints) if local_joints else len(joint_order)
+            starts.append(local_start)
+            tree_cutoff = int(global_articulation_end[int(articulation)])
+            tree_locals = [
+                local
+                for global_joint, local in joint_global_to_local.items()
+                if int(joint_articulation[global_joint]) == int(articulation) and global_joint < tree_cutoff
+            ]
+            ends.append(max(tree_locals) + 1 if tree_locals else local_start)
         starts.append(len(joint_order))
-        return starts
+        return starts, ends
 
     def _set_compact_articulation_extents(
         self,
